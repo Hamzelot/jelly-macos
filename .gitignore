@@ -1,0 +1,13 @@
+# Private WireGuard-Configs (enthalten Schlüssel!)
+*.conf
+
+# Setup-State mit lokaler Jellyfin-IP
+.setup_state
+
+# Build-Artefakte
+.venv/
+_jellyfin_app_build.py
+_make_icon.py
+
+# macOS
+.DS_Store
