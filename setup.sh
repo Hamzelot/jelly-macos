@@ -2,7 +2,7 @@
 # Jellyfin Menu Bar App – Setup (nutzt native WireGuard.app via scutil --nc)
 set -eo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 # GitHub-Repo für Update-Check
 REPO="Hamzelot/jelly-macos"
 REPO_RAW="https://raw.githubusercontent.com/${REPO}/main"
@@ -240,6 +240,7 @@ cat > "$APP_PY" << 'PYEOF'
 """Jellyfin Menubar — triggert macOS-native WireGuard.app via scutil --nc."""
 import rumps, subprocess, threading, time, socket, signal, atexit, sys
 import urllib.request
+from AppKit import NSWorkspace
 
 VERSION      = "VERSION_PLACEHOLDER"
 REPO         = "REPO_PLACEHOLDER"                # YOUR_USER/YOUR_REPO oder leer
@@ -299,10 +300,19 @@ def vpn_stop():
     except Exception:
         pass
 
-def wait_for_status(target, max_seconds):
+def wait_for_status(target, max_seconds, on_change=None):
+    """Wartet bis scutil den Ziel-Status meldet. on_change(status) wird bei
+    jedem Statuswechsel aufgerufen → live-Update in der UI."""
     deadline = time.monotonic() + max_seconds
+    last = None
     while time.monotonic() < deadline:
-        if vpn_status() == target:
+        status = vpn_status()
+        if status != last:
+            last = status
+            if on_change:
+                try: on_change(status)
+                except Exception: pass
+        if status == target:
             return True
         time.sleep(0.5)
     return False
@@ -365,6 +375,7 @@ class JellyfinApp(rumps.App):
         self.connected  = False
         self._busy      = False
         self.last_error = None
+        self._was_connected_before_sleep = False
 
         self.status_item = rumps.MenuItem("○ Nicht verbunden")
         self.error_item  = rumps.MenuItem("")      # sichtbar nur bei Fehler
@@ -402,6 +413,44 @@ class JellyfinApp(rumps.App):
         self._timer.start()
         threading.Thread(target=self._initial_check, daemon=True).start()
         threading.Thread(target=self._check_update, daemon=True).start()
+
+        # Sleep/Wake-Observer registrieren (macOS-native via NSWorkspace)
+        self._register_sleep_observers()
+
+    def _register_sleep_observers(self):
+        """Registriert Handler für System-Sleep und -Wake.
+        WillSleep → VPN trennen, DidWake → VPN reconnecten (wenn vorher verbunden)."""
+        nc = NSWorkspace.sharedWorkspace().notificationCenter()
+        nc.addObserver_selector_name_object_(
+            self, b"_willSleep:", "NSWorkspaceWillSleepNotification", None)
+        nc.addObserver_selector_name_object_(
+            self, b"_didWake:",   "NSWorkspaceDidWakeNotification",   None)
+
+    # PyObjc-Selektoren (Unterstrich-Suffix pro Obj-C-Konvention)
+    def _willSleep_(self, notification):
+        """Wird von macOS direkt vor System-Sleep aufgerufen (blocking)."""
+        if self.connected and not self._exiting_flag():
+            self._was_connected_before_sleep = True
+            # Synchron trennen — wir haben nur wenige Sekunden vor dem Sleep
+            vpn_stop()
+
+    def _didWake_(self, notification):
+        """Wird von macOS nach System-Wake aufgerufen."""
+        if self._was_connected_before_sleep and not self._busy:
+            self._was_connected_before_sleep = False
+            self._busy = True
+            threading.Thread(target=self._wake_reconnect, daemon=True).start()
+
+    def _wake_reconnect(self):
+        """Reconnect nach Wake — gibt dem Netzwerk kurz Zeit zu stabilisieren."""
+        time.sleep(3)
+        try:
+            self._do_connect()        # managed _busy selbst via finally
+        except Exception:
+            self._busy = False
+
+    def _exiting_flag(self):
+        return _exiting
 
     def _check_update(self):
         """Fragt GitHub nach neuer Version. Blendet Menü-Item ein wenn Update da."""
@@ -471,7 +520,8 @@ class JellyfinApp(rumps.App):
 
     def _do_connect(self):
         try:
-            self.title = "…"
+            self.title             = "…"
+            self.status_item.title = "… Verbinde"
             self._clear_error()
 
             # 1. VPN überhaupt in macOS vorhanden?
@@ -492,8 +542,15 @@ class JellyfinApp(rumps.App):
                 self._refresh_ui()
                 return
 
-            # 3. Auf "Connected" warten
-            if not wait_for_status("Connected", max_seconds=20):
+            # 3. Auf "Connected" warten, mit Live-Status-Update
+            def _on_change(status):
+                label = {"Connecting":    "… Verbinde",
+                         "Disconnecting": "… Trenne",
+                         "Disconnected":  "○ Nicht verbunden",
+                         "Connected":     "● Verbunden"}.get(status, f"… {status}")
+                self.status_item.title = label
+
+            if not wait_for_status("Connected", max_seconds=20, on_change=_on_change):
                 current = vpn_status() or "unbekannt"
                 self.connected = is_connected()
                 self._refresh_ui()
@@ -524,9 +581,18 @@ class JellyfinApp(rumps.App):
 
     def _do_disconnect(self):
         try:
-            self.title = "…"
+            self.title             = "…"
+            self.status_item.title = "… Trenne"
             vpn_stop()
-            wait_for_status("Disconnected", max_seconds=10)
+
+            def _on_change(status):
+                label = {"Connecting":    "… Verbinde",
+                         "Disconnecting": "… Trenne",
+                         "Disconnected":  "○ Nicht verbunden",
+                         "Connected":     "● Verbunden"}.get(status, f"… {status}")
+                self.status_item.title = label
+
+            wait_for_status("Disconnected", max_seconds=10, on_change=_on_change)
             self.connected = is_connected()
             self._refresh_ui()
             if not self.connected:
